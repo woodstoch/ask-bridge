@@ -280,6 +280,56 @@ test('normalizes a nested assistant marker to its outer agent turn', () => {
   }).progress, 27);
 });
 
+test('normalizes nested agent turns to the outermost agent turn', () => {
+  const outerTurn = turn({ markers: [marker(27)], images: [image()] });
+  const nestedTurn = new FakeElement({
+    className: 'agent-turn',
+    parentElement: outerTurn,
+  });
+  const document = new FakeDocument([nestedTurn]);
+
+  const result = inspectActiveImageProgress({
+    document,
+    assistantSelector: ASSISTANT_SELECTOR,
+    initialAssistantCount: 0,
+  });
+
+  assert.equal(findActiveTurn({
+    document,
+    assistantSelector: ASSISTANT_SELECTOR,
+    initialAssistantCount: 0,
+  }), outerTurn);
+  assert.equal(result.progress, 27);
+  assert.equal(result.candidateCount, 1);
+});
+
+test('chooses the latest response across selectors without a baseline', () => {
+  const latestSelector = '[data-testid="fallback-response"]';
+  const oldTurn = turn({ markers: [marker(20)] });
+  const latestFallback = new FakeElement({
+    attrs: { 'data-testid': 'fallback-response' },
+    markers: [marker(80)],
+  });
+  const document = {
+    querySelectorAll(selector) {
+      if (selector === ASSISTANT_SELECTOR) return [oldTurn];
+      if (selector === latestSelector) return [latestFallback];
+      if (selector === `${ASSISTANT_SELECTOR}, ${latestSelector}`) {
+        return [oldTurn, latestFallback];
+      }
+      return [];
+    },
+  };
+
+  const result = inspectActiveImageProgress({
+    document,
+    assistantSelector: ASSISTANT_SELECTOR,
+    latestSelector,
+  });
+
+  assert.equal(result.progress, 80);
+});
+
 test('keeps no-progress responses on the existing image readiness fallback', () => {
   const currentTurn = turn({ images: [image()] });
   const result = inspect([currentTurn]);

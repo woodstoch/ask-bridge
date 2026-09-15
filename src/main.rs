@@ -3329,8 +3329,27 @@ mod tests {
     }
 
     #[test]
+    fn scans_text_only_response_after_image_wait_budget_is_exhausted() {
+        let mut attempts = 0;
+        let images = wait_for_images(Duration::ZERO, Duration::from_secs(1), |remaining| {
+            assert_eq!(remaining, Duration::ZERO);
+            attempts += 1;
+            Ok(ImageScanResult {
+                images: Vec::new(),
+                should_retry: false,
+            })
+        })
+        .expect("an exhausted image budget must not fail a completed text-only response");
+
+        assert!(images.is_empty());
+        assert_eq!(attempts, 1);
+    }
+
+    #[test]
     fn times_out_when_image_scan_stays_not_ready() {
+        let mut attempts = 0;
         let error = wait_for_images(Duration::ZERO, Duration::ZERO, |_| {
+            attempts += 1;
             Ok(ImageScanResult {
                 images: Vec::new(),
                 should_retry: true,
@@ -3339,6 +3358,7 @@ mod tests {
         .expect_err("a permanently pending image should time out");
 
         assert!(error.contains("generated images"));
+        assert_eq!(attempts, 1);
     }
 
     #[test]
@@ -5031,12 +5051,11 @@ fn wait_for_images<F>(
 where
     F: FnMut(Duration) -> Result<ImageScanResult, String>,
 {
-    if timeout.is_zero() {
-        return Err("Timed out waiting for generated images to become ready".to_string());
-    }
     let started_at = Instant::now();
 
     loop {
+        // Always inspect once, even if copying the final response used the
+        // remaining budget: a text-only response has no image to wait for.
         let remaining = timeout.saturating_sub(started_at.elapsed());
         let result = scan(remaining)?;
         if !result.images.is_empty() || !result.should_retry {

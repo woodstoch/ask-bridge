@@ -96,15 +96,17 @@
       return { turn: null, count: turns.length, isNew: false };
     }
 
-    if (turns.length > 0) {
-      return { turn: normalizeTurn(turns[turns.length - 1]), count: turns.length, isNew };
-    }
-
     if (hasBaseline) {
+      if (turns.length > 0) {
+        return { turn: normalizeTurn(turns[turns.length - 1]), count: turns.length, isNew };
+      }
       return { turn: null, count: 0, isNew: false };
     }
 
-    const latestTurns = queryAll(activeDocument, latestSelector);
+    const responseSelector = assistantSelector === latestSelector
+      ? assistantSelector
+      : `${assistantSelector}, ${latestSelector}`;
+    const latestTurns = queryAll(activeDocument, responseSelector);
     return {
       turn: latestTurns.length > 0 ? normalizeTurn(latestTurns[latestTurns.length - 1]) : null,
       count: latestTurns.length,
@@ -114,17 +116,15 @@
 
   function normalizeTurn(element) {
     if (!element) return null;
-    if (typeof element.matches === 'function' && element.matches('.agent-turn')) return element;
-    if (typeof element.closest === 'function') {
-      return element.closest('.agent-turn') || element;
-    }
-
-    let current = element.parentElement || element.parentNode;
+    let normalized = element;
+    let current = element;
     while (current) {
-      if (typeof current.matches === 'function' && current.matches('.agent-turn')) return current;
+      if (typeof current.matches === 'function' && current.matches('.agent-turn')) {
+        normalized = current;
+      }
       current = current.parentElement || current.parentNode;
     }
-    return element;
+    return normalized;
   }
 
   function findActiveTurn(options = {}) {
