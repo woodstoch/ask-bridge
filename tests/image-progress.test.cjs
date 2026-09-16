@@ -2,6 +2,9 @@
 
 const assert = require('node:assert/strict');
 const test = require('node:test');
+const fs = require('node:fs');
+const path = require('node:path');
+const vm = require('node:vm');
 
 const {
   DEFAULT_PROGRESS_SELECTOR,
@@ -68,13 +71,19 @@ class FakeElement {
 }
 
 class FakeDocument {
-  constructor(turns) {
+  constructor(turns, selector = ASSISTANT_SELECTOR) {
     this.turns = turns;
+    this.selector = selector;
+    this.stopButton = null;
   }
 
   querySelectorAll(selector) {
-    if (selector === ASSISTANT_SELECTOR) return this.turns;
+    if (selector === this.selector) return this.turns;
     return [];
+  }
+
+  querySelector(selector) {
+    return selector === '[data-testid="stop-button"]' ? this.stopButton : null;
   }
 }
 
@@ -96,6 +105,8 @@ function image({ src = 'https://chatgpt.com/backend-api/estuary/content?id=1', c
     complete,
     naturalWidth,
     naturalHeight: naturalWidth,
+    addEventListener() {},
+    removeEventListener() {},
     getAttribute(name) {
       return name === 'src' ? src : null;
     },
@@ -361,41 +372,189 @@ test('keeps pending scans retryable for the Rust wall-clock timeout', () => {
 });
 
 
-test('text-only ChatGPT toolbars with mask-image CSS do not trigger image retries', () => {
-  const fs = require('node:fs');
-  const path = require('node:path');
-  const vm = require('node:vm');
-  const rust = fs.readFileSync(path.join(__dirname, '../src/main.rs'), 'utf8');
-  const helper = fs.readFileSync(path.join(__dirname, '../src/image-progress.cjs'), 'utf8');
-  const template = rust.slice(rust.indexOf('fn build_image_scan_script('))
-    .match(/r###"([\s\S]*?)"###/)[1];
+const rust = fs.readFileSync(path.join(__dirname, '../src/main.rs'), 'utf8');
+const helper = fs.readFileSync(path.join(__dirname, '../src/image-progress.cjs'), 'utf8');
+
+function embeddedScript(kind, {
+  chatgpt = true,
+  selector = ASSISTANT_SELECTOR,
+  latestSelector = selector,
+  baseline = 0,
+  timeout = 0,
+} = {}) {
+  const template = kind === 'response'
+    ? rust.match(/let response_check_js = r###"([\s\S]*?)"###/)[1]
+    : rust.slice(rust.indexOf('fn build_image_scan_script(')).match(/r###"([\s\S]*?)"###/)[1];
   const replacements = {
     __IMAGE_PROGRESS_HELPER__: helper,
-    __CHATGPT_PROGRESS__: 'true',
-    __LATEST_SELECTOR__: JSON.stringify(ASSISTANT_SELECTOR),
-    __ASSISTANT_SELECTOR__: JSON.stringify(ASSISTANT_SELECTOR),
-    __INITIAL_ASSISTANT_COUNT__: '0',
-    __STOP_SELECTORS__: '[]',
-    __IMAGE_WAIT_TIMEOUT_MS__: '100',
+    __CHATGPT_PROGRESS__: String(chatgpt),
+    __LATEST_SELECTOR__: JSON.stringify(latestSelector),
+    __ASSISTANT_SELECTOR__: JSON.stringify(selector),
+    __INITIAL_ASSISTANT_COUNT__: JSON.stringify(baseline),
+    __INITIAL_COUNT__: JSON.stringify(baseline),
+    __STOP_SELECTORS__: JSON.stringify(['[data-testid="stop-button"]']),
+    __IMAGE_WAIT_TIMEOUT_MS__: String(timeout),
   };
   let script = template;
   for (const [placeholder, value] of Object.entries(replacements)) {
     script = script.split(placeholder).join(value);
   }
+  assert.doesNotMatch(script, /__[A-Z_]+__/);
+  return script;
+}
 
+function scriptContext(document, overrides = {}) {
+  const context = {
+    document,
+    performance,
+    setTimeout,
+    clearTimeout,
+    getComputedStyle: () => ({ display: 'block', visibility: 'visible', opacity: '1' }),
+    ...overrides,
+  };
+  context.window = context;
+  return context;
+}
+
+function responseCheck(document, options) {
+  return vm.runInNewContext(`(${embeddedScript('response', options)})()`, scriptContext(document));
+}
+
+async function imageScan(document, options, overrides) {
+  const context = scriptContext(document, overrides);
+  vm.runInNewContext(`(${embeddedScript('scan', options)})()`, context);
+  const deadline = Date.now() + 2000;
+  while (context.__downloaded_images_status === 'pending' && Date.now() < deadline) {
+    await new Promise(resolve => setTimeout(resolve, 5));
+  }
+  assert.equal(context.__downloaded_images_status, 'success');
+  return JSON.parse(JSON.stringify(context.__downloaded_images));
+}
+
+const dataImage = index => image({ src: `data:image/png;base64,${Buffer.from(String(index)).toString('base64')}` });
+
+test('text-only ChatGPT toolbars with mask-image CSS do not trigger image retries at zero budget', async () => {
   const latest = turn({ textContent: 'ABIMG-TEXT-OK' });
   const toolbar = new FakeElement({ className: '[mask-image:linear-gradient(to_right,black,transparent)]' });
   latest.querySelector = (selector) => selector.includes('[class*="image"]') ? toolbar : null;
-  const context = {
-    document: new FakeDocument([latest]),
-    performance: { now: () => 0 },
-    setTimeout,
-    clearTimeout,
-  };
-  context.window = context;
-  vm.runInNewContext(`(${script})()`, context);
+  const result = await imageScan(new FakeDocument([latest]));
 
-  assert.equal(context.__downloaded_images_status, 'success');
-  assert.equal(context.__downloaded_images.images.length, 0);
-  assert.equal(context.__downloaded_images.shouldRetry, false);
+  assert.equal(result.images.length, 0);
+  assert.equal(result.shouldRetry, false);
 });
+
+test('embedded response script waits for a new turn and never downloads old images', async () => {
+  const document = new FakeDocument([turn({ markers: [marker(99)], images: [dataImage(1)] })]);
+  const result = responseCheck(document, { baseline: 1 });
+
+  assert.equal(result.status, 'waiting');
+  assert.equal(result.isNew, false);
+  assert.equal(result.imageProgressMarkerPresent, false);
+  const scan = await imageScan(document, { baseline: 1 });
+  assert.equal(scan.images.length, 0);
+  assert.equal(scan.shouldRetry, false);
+});
+
+test('embedded scripts keep every unfinished percentage pending without fetching a preview', async () => {
+  let fetches = 0;
+  for (const value of [0, 27, 99]) {
+    const document = new FakeDocument([turn({ markers: [marker(value)], images: [image()] })]);
+    assert.equal(responseCheck(document).status, 'generating');
+    const scan = await imageScan(document, {}, { fetch: () => { fetches += 1; throw new Error('must not fetch'); } });
+    assert.equal(scan.images.length, 0);
+    assert.equal(scan.shouldRetry, true);
+  }
+  assert.equal(fetches, 0);
+});
+
+test('embedded scripts wait at 100% until the image appears and finishes loading', async () => {
+  const latest = turn({ markers: [marker(100)] });
+  const document = new FakeDocument([latest]);
+  assert.equal(responseCheck(document).status, 'generating');
+  assert.equal((await imageScan(document)).shouldRetry, true);
+
+  const pending = image({ src: dataImage(1).src, complete: false, naturalWidth: 0 });
+  latest.images = [pending];
+  assert.equal(responseCheck(document).status, 'generating');
+  assert.equal((await imageScan(document)).shouldRetry, true);
+
+  pending.complete = true;
+  pending.naturalWidth = pending.naturalHeight = 1024;
+  assert.equal(responseCheck(document).status, 'done');
+  const scan = await imageScan(document);
+  assert.equal(scan.images.length, 1);
+  assert.equal(scan.shouldRetry, false);
+});
+
+test('embedded scripts reject a permanently broken image even at zero budget', async () => {
+  const latest = turn({ markers: [marker(100)], images: [image({ complete: true, naturalWidth: 0 })] });
+  const document = new FakeDocument([latest]);
+  assert.equal(responseCheck(document).status, 'generating');
+  const scan = await imageScan(document);
+  assert.equal(scan.candidateCount, 1);
+  assert.equal(scan.readyCount, 0);
+  assert.equal(scan.images.length, 0);
+  assert.equal(scan.shouldRetry, true);
+});
+
+test('embedded scripts do not finish a preview when the marker disappears before generation stops', async () => {
+  const latest = turn({ markers: [marker(70)], images: [dataImage(1)] });
+  const document = new FakeDocument([latest]);
+  document.stopButton = {
+    getAttribute: () => null,
+    getBoundingClientRect: () => ({ width: 20, height: 20 }),
+  };
+  latest.markers = [];
+  assert.equal(responseCheck(document).status, 'generating');
+  assert.equal((await imageScan(document)).shouldRetry, true);
+  document.stopButton = null;
+  assert.equal(responseCheck(document).status, 'done');
+  assert.equal((await imageScan(document)).images.length, 1);
+});
+
+test('embedded scan retries partial multi-image failures instead of claiming complete success', async () => {
+  const second = image({ src: 'https://chatgpt.com/unavailable.png' });
+  const document = new FakeDocument([turn({ images: [dataImage(1), second] })]);
+  document.createElement = () => ({ getContext: () => null });
+  const failed = await imageScan(document, {}, { fetch: async () => { throw new Error('offline'); } });
+  assert.equal(failed.candidateCount, 2);
+  assert.equal(failed.images.length, 0);
+  assert.equal(failed.shouldRetry, true);
+
+  second.src = dataImage(2).src;
+  second.currentSrc = second.src;
+  const recovered = await imageScan(document);
+  assert.equal(recovered.images.length, 2);
+  assert.equal(recovered.shouldRetry, false);
+});
+
+test('embedded scan uses latest fallback responses for Open/Get without a baseline', async () => {
+  const latestSelector = '[data-testid="fallback-response"]';
+  const old = turn({ markers: [marker(20)], images: [dataImage(1)] });
+  const latest = turn({ images: [dataImage(2)] });
+  const document = new FakeDocument([old]);
+  document.querySelectorAll = selector => {
+    if (selector === ASSISTANT_SELECTOR) return [old];
+    if (selector === `${ASSISTANT_SELECTOR}, ${latestSelector}`) return [old, latest];
+    return [];
+  };
+  const scan = await imageScan(document, { baseline: null, latestSelector });
+  assert.equal(scan.images.length, 1);
+  assert.equal(scan.images[0].src, latest.images[0].src);
+  assert.equal(scan.shouldRetry, false);
+});
+
+for (const [provider, selector] of [['Gemini', 'model-response'], ['Claude', '.font-claude-response']]) {
+  test(`embedded scripts preserve ${provider} text and image behavior`, async () => {
+    const latest = turn({ textContent: 'TEXT-OK', markers: [marker(40)] });
+    const document = new FakeDocument([latest], selector);
+    const options = { chatgpt: false, selector };
+    assert.equal(responseCheck(document, options).status, 'done');
+    assert.equal(responseCheck(document, { ...options, baseline: 1 }).status, 'waiting');
+    assert.equal((await imageScan(document, options)).shouldRetry, false);
+    latest.images = [dataImage(1), dataImage(2)];
+    const scan = await imageScan(document, options);
+    assert.equal(scan.images.length, 2);
+    assert.equal(scan.shouldRetry, false);
+  });
+}

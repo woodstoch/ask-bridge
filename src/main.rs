@@ -3362,6 +3362,56 @@ mod tests {
     }
 
     #[test]
+    fn fails_incomplete_chatgpt_image_response_after_progress_disappears() {
+        let mut state = ChatGptImageResponseState::default();
+        state.observe(&serde_json::json!({
+            "isNew": true,
+            "imageProgressMarkerPresent": true,
+            "imageProgress": 100,
+            "imageCandidateCount": 0,
+        }));
+        state.observe(&serde_json::json!({
+            "isNew": true,
+            "imageProgressMarkerPresent": false,
+            "imageCandidateCount": 0,
+        }));
+
+        assert!(state.ensure_completed(false).is_err());
+        assert!(state.ensure_completed(true).is_ok());
+    }
+
+    #[test]
+    fn fails_incomplete_chatgpt_image_response_without_a_percentage() {
+        let mut state = ChatGptImageResponseState::default();
+        state.observe(&serde_json::json!({
+            "isNew": true,
+            "imageProgressMarkerPresent": false,
+            "imageCandidateCount": 1,
+        }));
+
+        assert!(state.ensure_completed(false).is_err());
+    }
+
+    #[test]
+    fn preserves_text_only_and_old_response_timeout_behavior() {
+        let mut state = ChatGptImageResponseState::default();
+        assert!(state.ensure_completed(false).is_ok());
+        state.observe(&serde_json::json!({
+            "isNew": false,
+            "imageProgressMarkerPresent": true,
+            "imageCandidateCount": 1,
+        }));
+        state.observe(&serde_json::json!({
+            "isNew": true,
+            "imageProgressMarkerPresent": false,
+            "imageCandidateCount": 0,
+        }));
+
+        assert!(state.ensure_completed(false).is_ok());
+        assert!(state.ensure_completed(true).is_ok());
+    }
+
+    #[test]
     fn handles_large_image_wait_timeout_without_overflow() {
         let images = wait_for_images(Duration::from_secs(u64::MAX), Duration::ZERO, |_| {
             Ok(ImageScanResult {
@@ -5037,6 +5087,26 @@ fn scrape_latest_markdown_from_dom(
 struct ImageScanResult {
     images: Vec<Value>,
     should_retry: bool,
+}
+
+#[derive(Default)]
+struct ChatGptImageResponseState {
+    seen: bool,
+}
+
+impl ChatGptImageResponseState {
+    fn observe(&mut self, response: &Value) {
+        self.seen |= response["isNew"].as_bool() == Some(true)
+            && (response["imageProgressMarkerPresent"].as_bool() == Some(true)
+                || response["imageCandidateCount"].as_u64().unwrap_or(0) > 0);
+    }
+
+    fn ensure_completed(&self, finished: bool) -> Result<(), String> {
+        if self.seen && !finished {
+            return Err("Timed out waiting for ChatGPT image generation to complete".to_string());
+        }
+        Ok(())
+    }
 }
 
 const IMAGE_SCAN_RETRY_INTERVAL: Duration = Duration::from_millis(250);
@@ -7700,6 +7770,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut wait_cycles = 0;
     let mut stable_done_checks = 0;
     let mut last_image_progress: Option<u8> = None;
+    let mut image_response_state = ChatGptImageResponseState::default();
     let spinner_frames = vec!["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
     let mut spinner_idx = 0;
     let response_wait_timeout = Duration::from_secs(cli.timeout);
@@ -7848,6 +7919,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 let status = parsed["status"].as_str().unwrap_or("waiting");
                 let is_new = parsed["isNew"].as_bool().unwrap_or(false);
                 if provider == Provider::ChatGpt {
+                    image_response_state.observe(&parsed);
                     let progress = parsed["imageProgress"]
                         .as_u64()
                         .and_then(|value| u8::try_from(value).ok());
@@ -7959,6 +8031,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             println!("\nThread Link: {}", url);
         }
     }
+
+    image_response_state.ensure_completed(finished)?;
 
     if let Some(error) = image_download_error {
         eprintln!("Error downloading images: {}", error);
